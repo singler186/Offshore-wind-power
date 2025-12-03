@@ -1,0 +1,87 @@
+// =======================================================
+// 1. 載入資料與設定
+// =======================================================
+
+// 載入您的離岸風電位置
+var offshore_sites = ee.FeatureCollection("projects/ee-singler97/assets/offshore");
+
+Map.centerObject(offshore_sites, 10); // 放大一點看細節
+Map.addLayer(offshore_sites, {color: 'red'}, 'Offshore Wind Farms');
+
+// 設定時間範圍：建議拉長一點，確保有云量少的影像
+// 嘗試分析一整年的平均，或者特定的無雲季節
+var startDate = '2019-01-01';
+var endDate = '2019-12-31';
+
+// 去雲函式 (Sentinel-2 必備)
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+// 載入 Sentinel-2 SR (表面反射率)
+var dataset = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                  .filterDate(startDate, endDate)
+                  // 過濾掉雲量太多的圖，只留雲量 < 20% 的日子
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)) 
+                  .filterBounds(offshore_sites) // 只選風場附近的圖
+                  .map(maskS2clouds);
+
+// 檢查一下這段時間抓到了幾張圖
+print('Found images:', dataset.size());
+
+// =======================================================
+// 2. 計算 NDCI (葉綠素指標)
+// =======================================================
+
+// 建立 NDCI 函式
+// NDCI = (B5 - B4) / (B5 + B4)
+// B5 = Red Edge (705 nm), B4 = Red (665 nm)
+var addNDCI = function(image) {
+  var ndci = image.expression(
+    '(B5 - B4) / (B5 + B4)', {
+      'B5': image.select('B5'),
+      'B4': image.select('B4')
+    }).rename('NDCI');
+  return image.addBands(ndci);
+};
+
+// 將整個 Dataset 計算 NDCI 並取平均值
+var s2_ndci = dataset.map(addNDCI).select('NDCI').mean();
+
+// =======================================================
+// 3. 視覺化與範圍設定
+// =======================================================
+
+// NDCI 的數值通常在 -0.1 到 0.5 之間 (水體)
+// 數值越高，代表葉綠素濃度越高 (呈現綠色/紅色)
+var ndciVis = {
+  min: -0.1,
+  max: 0.3,
+  palette: ['0000ff', '00ffff', '00ff00', 'ffff00', 'ff0000']
+};
+
+// 設定輸出範圍：風場外擴 5公里 (5000公尺)
+// 使用 buffer 確保即使風場是點狀也能輸出周圍
+var export_region = offshore_sites.geometry().buffer(5000).bounds();
+
+Map.addLayer(s2_ndci.clip(export_region), ndciVis, 'Sentinel-2 NDCI Mean');
+
+// =======================================================
+// 4. 輸出設定 (Export)
+// =======================================================
+
+Export.image.toDrive({
+  image: s2_ndci,
+  description: 'Taiwan_Offshore_S2_NDCI_2019',
+  folder: 'GEE_Export',
+  region: export_region,
+  scale: 20,           // Sentinel-2 解析度設為 20米 (B5波段原始解析度)
+  crs: 'EPSG:3826',    // TWD97 座標
+  maxPixels: 1e13
+});
