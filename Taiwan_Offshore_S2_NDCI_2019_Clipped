@@ -1,0 +1,80 @@
+// =======================================================
+// 1. 載入資料與設定
+// =======================================================
+
+// 載入您的離岸風電位置
+var offshore_sites = ee.FeatureCollection("projects/ee-singler97/assets/offshore");
+
+Map.centerObject(offshore_sites, 10); 
+Map.addLayer(offshore_sites, {color: 'red'}, 'Offshore Wind Farms');
+
+var startDate = '2019-01-01';
+var endDate = '2019-12-31';
+
+// 去雲函式
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+// 載入 Sentinel-2 SR
+var dataset = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                  .filterDate(startDate, endDate)
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)) 
+                  .filterBounds(offshore_sites) 
+                  .map(maskS2clouds);
+
+print('Found images:', dataset.size());
+
+// =======================================================
+// 2. 計算 NDCI (葉綠素指標)
+// =======================================================
+
+var addNDCI = function(image) {
+  var ndci = image.expression(
+    '(B5 - B4) / (B5 + B4)', {
+      'B5': image.select('B5'),
+      'B4': image.select('B4')
+    }).rename('NDCI');
+  return image.addBands(ndci);
+};
+
+// 計算平均值
+var s2_ndci = dataset.map(addNDCI).select('NDCI').mean();
+
+// =======================================================
+// 3. 視覺化與範圍設定 (關鍵修改處)
+// =======================================================
+
+var ndciVis = {
+  min: -0.1,
+  max: 0.3,
+  palette: ['0000ff', '00ffff', '00ff00', 'ffff00', 'ff0000']
+};
+
+// 【修改 1】: 不再外擴 (Buffer) 也不取大矩形 (Bounds)，直接用原始形狀
+// 如果你的 shapefile 是多個不連續的多邊形，這裡會自動處理為 MultiPolygon
+var export_geometry = offshore_sites.geometry();
+
+// 為了在地圖上確認範圍，我們只顯示裁切後的結果
+Map.addLayer(s2_ndci.clip(export_geometry), ndciVis, 'Sentinel-2 NDCI Mean (Clipped)');
+
+// =======================================================
+// 4. 輸出設定 (關鍵修改處)
+// =======================================================
+
+Export.image.toDrive({
+  // 【修改 2】: 這裡加上 .clip(export_geometry)
+  // 這會讓形狀以外的像素變成 "Masked" (透明)，GEE 就不會去運算它，速度會快很多
+  image: s2_ndci.clip(export_geometry),
+  description: 'Taiwan_Offshore_S2_NDCI_2019_Clipped',
+  folder: 'GEE_Export',
+  region: export_geometry, // 限制輸出範圍幾何
+  scale: 20,
+  crs: 'EPSG:3826',
+  maxPixels: 1e13
+});
