@@ -1,0 +1,108 @@
+// =======================================================
+// 1. 載入資料與區域設定
+// =======================================================
+
+// 載入您的離岸風電位置
+var offshore_sites = ee.FeatureCollection("projects/ee-singler97/assets/offshore");
+
+// 取得幾何形狀 (用於裁切與限制範圍)
+var geometry = offshore_sites.geometry();
+
+Map.centerObject(offshore_sites, 10);
+Map.addLayer(offshore_sites, {color: 'red'}, 'Offshore Wind Farms');
+
+// 設定回歸年份範圍 (2019 - 2024)
+var years = ee.List.sequence(2019, 2024);
+
+// =======================================================
+// 2. 定義函式 (去雲 & NDCI)
+// =======================================================
+
+// Sentinel-2 去雲函式
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+// NDCI 計算函式
+var addNDCI = function(image) {
+  var ndci = image.expression(
+    '(B5 - B4) / (B5 + B4)', {
+      'B5': image.select('B5'),
+      'B4': image.select('B4')
+    }).rename('NDCI');
+  return image.addBands(ndci);
+};
+
+// =======================================================
+// 3. 年度迴圈計算 (核心邏輯)
+// =======================================================
+
+var yearlyNDCI = years.map(function(year) {
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = ee.Date.fromYMD(year, 12, 31);
+
+  // 篩選該年度的 Sentinel-2 影像
+  var ndciMean = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .filterBounds(geometry) // 初步過濾範圍
+    .map(maskS2clouds)      // 去雲
+    .map(addNDCI)           // 算 NDCI
+    .select('NDCI')         // 只留 NDCI 波段
+    .mean()                 // 取年度平均
+    .clip(geometry)         // 【優化】：在這裡就裁切，減少後續運算量
+    .set('year', year);     // 設定屬性方便檢查
+
+  // 為了跑回歸，必須增加一個代表年份的波段
+  // 並轉為 float 避免格式問題
+  return ndciMean.addBands(ee.Image.constant(year).rename('year')).float();
+});
+
+// 將 List 轉回 ImageCollection
+var ndciCol = ee.ImageCollection(yearlyNDCI);
+
+// =======================================================
+// 4. 線性回歸擬合趨勢 (Linear Fit)
+// =======================================================
+
+// linearFit 嚴格要求波段順序： Band 0 = X軸 (年份), Band 1 = Y軸 (NDCI)
+// 我們的 ndciCol 目前是 [NDCI, year]，所以必須用 select 重排順序
+var ndciFit = ndciCol.select(['year', 'NDCI']).reduce(ee.Reducer.linearFit());
+
+// 取出斜率 (Scale)
+// 正值 = 趨勢增加 (變綠)，負值 = 趨勢減少
+var ndciSlope = ndciFit.select('scale');
+
+// =======================================================
+// 5. 視覺化
+// =======================================================
+
+// 設定視覺化參數
+// NDCI 的年變化通常很微小，所以 min/max 設小一點才看得出對比
+// 藍色 = 減少, 白色 = 持平, 紅色 = 增加
+var slopeVis = {
+  min: -0.01, 
+  max: 0.01,  
+  palette: ['blue', 'white', 'red']
+};
+
+Map.addLayer(ndciSlope, slopeVis, 'NDCI Trend Slope (2019-2024)');
+
+// =======================================================
+// 6. 輸出設定 (GeoTIFF)
+// =======================================================
+
+Export.image.toDrive({
+  image: ndciSlope, // 已經在迴圈中 clip 過了，這裡直接輸出即可
+  description: 'Taiwan_Offshore_NDCI_Slope_2019_2024',
+  folder: 'GEE_Export',
+  region: geometry,
+  scale: 20,          // Sentinel-2 解析度
+  crs: 'EPSG:3826',   // TWD97
+  maxPixels: 1e13
+});
