@@ -1,0 +1,67 @@
+
+// =====================
+// 1. 載入離岸風場 shp
+// =====================
+var farms = ee.FeatureCollection('projects/ieo-project-475912/assets/OffshoreWindFarmsPosition');
+Map.centerObject(farms, 7);
+Map.addLayer(farms, {color: 'red'}, 'Offshore wind farms');
+
+// =====================
+// 2. Chlorophyll dataset
+// =====================
+var chl = ee.ImageCollection('NASA/OCEANDATA/MODIS-Aqua/L3SMI');
+
+var startDate = '2020-01-01';
+var endDate   = '2020-12-31';
+
+var chlPeriod = chl
+  .filterDate(startDate, endDate)
+  .select('chlor_a');
+
+// =====================
+// 3. 平均 chlorophyll-a
+// =====================
+var chlMean = chlPeriod.mean().rename('chlor_a_mean');
+
+Map.addLayer(chlMean,
+  {min:0, max:10, palette:['0000ff','00ffff','00ff00','ffff00','ff0000']},
+  'Mean Chlorophyll');
+
+// =====================
+// 4. Zonal stats (較小範圍解析度)
+// =====================
+
+// ←←← 修改這裡的 scale（解析度越小越細緻）
+// var scale = 4000; // 原本
+var scale = 2000;    // 推薦：2 km
+// var scale = 1000; // 1 km
+// var scale = 500;  // 500 m
+// var scale = 250;  // 250 m
+
+var farmsWithChl = chlMean.reduceRegions({
+  collection: farms,
+  reducer: ee.Reducer.mean(),
+  scale: scale
+});
+
+farmsWithChl = farmsWithChl.map(function (f) {
+  return f.set('chl_mean', f.get('mean'))
+          .select(f.propertyNames());
+});
+
+print('Farms with chlorophyll mean (scaled):', farmsWithChl.limit(5));
+
+// =====================
+// 5. Export to CSV & SHP
+// =====================
+Export.table.toDrive({
+  collection: farmsWithChl,
+  description: 'OffshoreWindFarms_Chl_Scaled_CSV',
+  fileFormat: 'CSV'
+});
+
+Export.table.toDrive({
+  collection: farmsWithChl,
+  description: 'OffshoreWindFarms_Chl_Scaled_SHP',
+  fileFormat: 'SHP'
+});
